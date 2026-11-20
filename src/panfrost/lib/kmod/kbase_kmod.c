@@ -370,13 +370,16 @@ kbase_alloc_dmabuf(uint64_t size, void **out_ahb)
 {
    *out_ahb = NULL;
 
-   /* 1. Try direct /dev/dma_heap/system first (fast path when SELinux allows). */
-   static const char *const heap_paths[] = {
-      "/dev/dma_heap/system",
+   /* 1. Try uncached (write-combining) DMA-BUF heaps FIRST!
+    *    Vulkan HOST_COHERENT placed memory requires CPU writes to be visible to the GPU
+    *    immediately without explicit cache flushes. Using cached /dev/dma_heap/system leaves
+    *    dirty 64-byte CPU cache lines, causing horizontal corruption bars and green blocks. */
+   static const char *const uncached_heap_paths[] = {
       "/dev/dma_heap/system-uncached",
+      "/dev/dma_heap/mtk_mm-uncached",
    };
-   for (unsigned i = 0; i < ARRAY_SIZE(heap_paths); i++) {
-      int heap_fd = open(heap_paths[i], O_RDONLY | O_CLOEXEC);
+   for (unsigned i = 0; i < ARRAY_SIZE(uncached_heap_paths); i++) {
+      int heap_fd = open(uncached_heap_paths[i], O_RDONLY | O_CLOEXEC);
       if (heap_fd < 0)
          continue;
       struct kbase_dma_heap_allocation_data alloc = {
@@ -389,47 +392,58 @@ kbase_alloc_dmabuf(uint64_t size, void **out_ahb)
          return (int)alloc.fd;
    }
 
-   /* 2. Fallback to Android AHardwareBuffer BLOB (works under strict Android 13-16 SELinux). */
-   if (size > UINT32_MAX)
-      return -1;
-
-   kbase_ahb_api_init();
-   if (!kbase_ahb_api.allocate || !kbase_ahb_api.release || !kbase_ahb_api.get_native_handle)
-      return -1;
-
-   kbase_ahb_desc desc = {
-      .width = (uint32_t)size,
-      .height = 1,
-      .layers = 1,
-      .format = 0x21, /* AHARDWAREBUFFER_FORMAT_BLOB */
-      .usage = 0x3ull | 0x30ull | (1ull << 24), /* CPU_READ_OFTEN | CPU_WRITE_OFTEN | GPU_DATA_BUFFER */
-   };
-   void *ahb = NULL;
-   if (kbase_ahb_api.allocate(&desc, &ahb) != 0 || !ahb) {
-      /* Retry without GPU_DATA_BUFFER in case older gralloc rejects bit 24. */
-      desc.usage = 0x3ull | 0x30ull;
-      if (kbase_ahb_api.allocate(&desc, &ahb) != 0 || !ahb)
-         return -1;
-   }
-
-   const kbase_native_handle *nh = kbase_ahb_api.get_native_handle(ahb);
-   int dmabuf_fd = -1;
-   if (nh && nh->numFds > 0) {
-      for (int i = 0; i < nh->numFds; i++) {
-         if (nh->data[i] >= 0) {
-            dmabuf_fd = fcntl(nh->data[i], F_DUPFD_CLOEXEC, 0);
-            break;
+   /* 2. Fallback to Android AHardwareBuffer BLOB with RARELY (uncached/WC on Mali gralloc). */
+   if (size <= UINT32_MAX) {
+      kbase_ahb_api_init();
+      if (kbase_ahb_api.allocate && kbase_ahb_api.release && kbase_ahb_api.get_native_handle) {
+         kbase_ahb_desc desc = {
+            .width = (uint32_t)size,
+            .height = 1,
+            .layers = 1,
+            .format = 0x21, /* AHARDWAREBUFFER_FORMAT_BLOB */
+            /* CPU_READ_RARELY (0x2) | CPU_WRITE_RARELY (0x20) | GPU_DATA_BUFFER (1<<24):
+             * requests uncached / write-combining memory so CPU writes are GPU-coherent. */
+            .usage = 0x2ull | 0x20ull | (1ull << 24),
+         };
+         void *ahb = NULL;
+         if (kbase_ahb_api.allocate(&desc, &ahb) != 0 || !ahb) {
+            desc.usage = 0x2ull | 0x20ull;
+            kbase_ahb_api.allocate(&desc, &ahb);
+         }
+         if (ahb) {
+            const kbase_native_handle *nh = kbase_ahb_api.get_native_handle(ahb);
+            int dmabuf_fd = -1;
+            if (nh && nh->numFds > 0) {
+               for (int i = 0; i < nh->numFds; i++) {
+                  if (nh->data[i] >= 0) {
+                     dmabuf_fd = fcntl(nh->data[i], F_DUPFD_CLOEXEC, 0);
+                     break;
+                  }
+               }
+            }
+            if (dmabuf_fd >= 0) {
+               *out_ahb = ahb;
+               return dmabuf_fd;
+            }
+            kbase_ahb_api.release(ahb);
          }
       }
    }
 
-   if (dmabuf_fd < 0) {
-      kbase_ahb_api.release(ahb);
-      return -1;
+   /* 3. Last resort: cached /dev/dma_heap/system. */
+   int heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+   if (heap_fd >= 0) {
+      struct kbase_dma_heap_allocation_data alloc = {
+         .len = size,
+         .fd_flags = O_RDWR | O_CLOEXEC,
+      };
+      int ret = ioctl(heap_fd, KBASE_DMA_HEAP_IOCTL_ALLOC, &alloc);
+      close(heap_fd);
+      if (ret == 0 && (int)alloc.fd >= 0)
+         return (int)alloc.fd;
    }
 
-   *out_ahb = ahb;
-   return dmabuf_fd;
+   return -1;
 }
 
 struct kbase_kmod_vm {
@@ -796,17 +810,29 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
       if (dmabuf_fd >= 0) {
          int dmabuf = dmabuf_fd;
          union kbase_ioctl_mem_import ireq;
-         memset(&ireq, 0, sizeof(ireq));
-         ireq.in.flags = 0xfull | BASE_MEM_SAME_VA;
-         ireq.in.phandle = (uint64_t)(uintptr_t)&dmabuf;
-         ireq.in.type = BASE_MEM_IMPORT_TYPE_UMM;
          static bool alloc_import_40;
-         int iret = pan_kmod_ioctl(dev->fd, alloc_import_40 ? KBASE_IOCTL_MEM_IMPORT_40
-                                                            : KBASE_IOCTL_MEM_IMPORT, &ireq);
-         if (iret && errno == ENOTTY && !alloc_import_40) {
-            iret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_40, &ireq);
+         static bool alloc_import_no_coherent;
+         int iret = -1;
+
+         /* Try importing with BASE_MEM_COHERENT_LOCAL first so Mali's internal units
+          * (tiler/fragment/compute) stay coherent; fall back if kbase rejects it on UMM. */
+         for (int attempt = alloc_import_no_coherent ? 1 : 0; attempt < 2; attempt++) {
+            memset(&ireq, 0, sizeof(ireq));
+            ireq.in.flags = 0xfull | BASE_MEM_SAME_VA |
+                            (attempt == 0 ? BASE_MEM_COHERENT_LOCAL : 0);
+            ireq.in.phandle = (uint64_t)(uintptr_t)&dmabuf;
+            ireq.in.type = BASE_MEM_IMPORT_TYPE_UMM;
+            iret = pan_kmod_ioctl(dev->fd, alloc_import_40 ? KBASE_IOCTL_MEM_IMPORT_40
+                                                           : KBASE_IOCTL_MEM_IMPORT, &ireq);
+            if (iret && errno == ENOTTY && !alloc_import_40) {
+               iret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_40, &ireq);
+               if (!iret)
+                  alloc_import_40 = true;
+            }
             if (!iret)
-               alloc_import_40 = true;
+               break;
+            if (attempt == 0)
+               alloc_import_no_coherent = true;
          }
          if (!iret && (ireq.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) &&
              ireq.out.va_pages >= pages) {
