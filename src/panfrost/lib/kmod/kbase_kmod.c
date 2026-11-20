@@ -945,10 +945,20 @@ static void *
 kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
 {
    struct kbase_kmod_bo *kbase_bo = container_of(bo, struct kbase_kmod_bo, base);
-   /* For DMA-BUF backed BOs, MAP_FIXED / placed mappings must target the dma-buf fd
-    * because kbase (/dev/mali0) rejects MAP_FIXED and address hints. */
-   if (kbase_bo->dmabuf_fd >= 0 && ((flags & MAP_FIXED) || host_addr != NULL))
-      return os_mmap(host_addr, bo->size, prot, flags, kbase_bo->dmabuf_fd, 0);
+   /* For DMA-BUF backed BOs, ALWAYS map via the dma-buf fd (both for MAP_FIXED / placed
+    * mappings and for normal host mappings, since /dev/mali0 UMM mappings can fault with
+    * SIGBUS BUS_ADRERR on CPU writes). */
+   if (kbase_bo->dmabuf_fd >= 0) {
+      void *ptr = os_mmap(host_addr, bo->size, prot, flags, kbase_bo->dmabuf_fd, 0);
+      /* Once mapped with MAP_FIXED, the kernel VMA holds its own reference to the
+       * dma-buf file. Close the userspace fd immediately so games with 1000+ placed
+       * memory pools (like Zelda BOTW) don't exhaust Android's RLIMIT_NOFILE (EMFILE). */
+      if (ptr != MAP_FAILED && (flags & MAP_FIXED)) {
+         close(kbase_bo->dmabuf_fd);
+         kbase_bo->dmabuf_fd = -1;
+      }
+      return ptr;
+   }
 
    /* Both zones map at offset = the BO's GPU VA. For an exec BO that is the address the kernel
     * returned; for an ordinary one it is the anchor's address, and mapping it again yields a
