@@ -24,7 +24,7 @@ struct panvk_cmd_meta_compute_save_ctx {
    } cs;
    const struct panvk_descriptor_set *set0;
    struct {
-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
+      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS * 8];
       uint64_t descs_dev_addr;
       uint32_t desc_count;
       bool dirty;
@@ -38,7 +38,7 @@ struct panvk_cmd_meta_graphics_save_ctx {
    const struct panvk_graphics_pipeline *pipeline;
    const struct panvk_descriptor_set *set0;
    struct {
-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
+      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS * 8];
       uint64_t descs_dev_addr;
       uint32_t desc_count;
       bool dirty;
