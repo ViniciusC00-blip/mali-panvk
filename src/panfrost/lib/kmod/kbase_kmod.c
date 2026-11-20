@@ -24,6 +24,7 @@
  */
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -301,8 +302,135 @@ struct kbase_kmod_bo {
    /* The mapping that FIXES gpu_va for an ordinary (SAME_VA) allocation, and whose lifetime is
     * the allocation's. NULL for an executable one, whose address comes from the kernel. */
    void *anchor;
+   int dmabuf_fd;
+   void *ahb;
    bool exec;
 };
+
+/* ---- DMA-BUF allocation helpers (for placed memory maps & external_memory_fd) -------------- */
+
+struct kbase_dma_heap_allocation_data {
+   uint64_t len;
+   uint32_t fd;
+   uint32_t fd_flags;
+   uint64_t heap_flags;
+};
+#define KBASE_DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x0, struct kbase_dma_heap_allocation_data)
+
+typedef struct {
+   uint32_t width;
+   uint32_t height;
+   uint32_t layers;
+   uint32_t format;
+   uint64_t usage;
+   uint32_t stride;
+   uint32_t rfu0;
+   uint64_t rfu1;
+} kbase_ahb_desc;
+
+typedef struct {
+   int version;
+   int numFds;
+   int numInts;
+   int data[1];
+} kbase_native_handle;
+
+typedef int (*kbase_pfn_ahb_allocate)(const kbase_ahb_desc *desc, void **outBuffer);
+typedef void (*kbase_pfn_ahb_release)(void *buffer);
+typedef const kbase_native_handle *(*kbase_pfn_ahb_get_native_handle)(const void *buffer);
+
+static struct {
+   bool init;
+   kbase_pfn_ahb_allocate allocate;
+   kbase_pfn_ahb_release release;
+   kbase_pfn_ahb_get_native_handle get_native_handle;
+} kbase_ahb_api;
+
+static pthread_mutex_t kbase_ahb_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+kbase_ahb_api_init(void)
+{
+   pthread_mutex_lock(&kbase_ahb_lock);
+   if (!kbase_ahb_api.init) {
+      void *lib = dlopen("libnativewindow.so", RTLD_LAZY | RTLD_LOCAL);
+      if (lib) {
+         kbase_ahb_api.allocate = (kbase_pfn_ahb_allocate)dlsym(lib, "AHardwareBuffer_allocate");
+         kbase_ahb_api.release = (kbase_pfn_ahb_release)dlsym(lib, "AHardwareBuffer_release");
+         kbase_ahb_api.get_native_handle =
+            (kbase_pfn_ahb_get_native_handle)dlsym(lib, "AHardwareBuffer_getNativeHandle");
+      }
+      kbase_ahb_api.init = true;
+   }
+   pthread_mutex_unlock(&kbase_ahb_lock);
+}
+
+static int
+kbase_alloc_dmabuf(uint64_t size, void **out_ahb)
+{
+   *out_ahb = NULL;
+
+   /* 1. Try direct /dev/dma_heap/system first (fast path when SELinux allows). */
+   static const char *const heap_paths[] = {
+      "/dev/dma_heap/system",
+      "/dev/dma_heap/system-uncached",
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(heap_paths); i++) {
+      int heap_fd = open(heap_paths[i], O_RDONLY | O_CLOEXEC);
+      if (heap_fd < 0)
+         continue;
+      struct kbase_dma_heap_allocation_data alloc = {
+         .len = size,
+         .fd_flags = O_RDWR | O_CLOEXEC,
+      };
+      int ret = ioctl(heap_fd, KBASE_DMA_HEAP_IOCTL_ALLOC, &alloc);
+      close(heap_fd);
+      if (ret == 0 && (int)alloc.fd >= 0)
+         return (int)alloc.fd;
+   }
+
+   /* 2. Fallback to Android AHardwareBuffer BLOB (works under strict Android 13-16 SELinux). */
+   if (size > UINT32_MAX)
+      return -1;
+
+   kbase_ahb_api_init();
+   if (!kbase_ahb_api.allocate || !kbase_ahb_api.release || !kbase_ahb_api.get_native_handle)
+      return -1;
+
+   kbase_ahb_desc desc = {
+      .width = (uint32_t)size,
+      .height = 1,
+      .layers = 1,
+      .format = 0x21, /* AHARDWAREBUFFER_FORMAT_BLOB */
+      .usage = 0x3ull | 0x30ull | (1ull << 24), /* CPU_READ_OFTEN | CPU_WRITE_OFTEN | GPU_DATA_BUFFER */
+   };
+   void *ahb = NULL;
+   if (kbase_ahb_api.allocate(&desc, &ahb) != 0 || !ahb) {
+      /* Retry without GPU_DATA_BUFFER in case older gralloc rejects bit 24. */
+      desc.usage = 0x3ull | 0x30ull;
+      if (kbase_ahb_api.allocate(&desc, &ahb) != 0 || !ahb)
+         return -1;
+   }
+
+   const kbase_native_handle *nh = kbase_ahb_api.get_native_handle(ahb);
+   int dmabuf_fd = -1;
+   if (nh && nh->numFds > 0) {
+      for (int i = 0; i < nh->numFds; i++) {
+         if (nh->data[i] >= 0) {
+            dmabuf_fd = fcntl(nh->data[i], F_DUPFD_CLOEXEC, 0);
+            break;
+         }
+      }
+   }
+
+   if (dmabuf_fd < 0) {
+      kbase_ahb_api.release(ahb);
+      return -1;
+   }
+
+   *out_ahb = ahb;
+   return dmabuf_fd;
+}
 
 struct kbase_kmod_vm {
    struct pan_kmod_vm base;
@@ -656,6 +784,51 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
       return NULL;
 
    const uint64_t pages = DIV_ROUND_UP(size, 4096);
+
+   /* When exclusive_vm is NULL (exportable or placed-memory host-visible allocation),
+    * back the BO with a DMA-BUF (via dma_heap or Android AHardwareBuffer) and import
+    * it into kbase. This allows MAP_FIXED (VK_EXT_map_memory_placed) and fd export
+    * (VK_KHR_external_memory_fd), both of which raw /dev/mali0 MEM_ALLOC refuses. */
+   if (exclusive_vm == NULL && !exec && !grow &&
+       !(flags & PAN_KMOD_BO_FLAG_KBASE_SYNC)) {
+      void *ahb = NULL;
+      int dmabuf_fd = kbase_alloc_dmabuf(pages * 4096, &ahb);
+      if (dmabuf_fd >= 0) {
+         int dmabuf = dmabuf_fd;
+         union kbase_ioctl_mem_import ireq;
+         memset(&ireq, 0, sizeof(ireq));
+         ireq.in.flags = 0xfull | BASE_MEM_SAME_VA;
+         ireq.in.phandle = (uint64_t)(uintptr_t)&dmabuf;
+         ireq.in.type = BASE_MEM_IMPORT_TYPE_UMM;
+         static bool alloc_import_40;
+         int iret = pan_kmod_ioctl(dev->fd, alloc_import_40 ? KBASE_IOCTL_MEM_IMPORT_40
+                                                            : KBASE_IOCTL_MEM_IMPORT, &ireq);
+         if (iret && errno == ENOTTY && !alloc_import_40) {
+            iret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_40, &ireq);
+            if (!iret)
+               alloc_import_40 = true;
+         }
+         if (!iret && (ireq.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) &&
+             ireq.out.va_pages >= pages) {
+            void *anchor = mmap(NULL, ireq.out.va_pages * 4096, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, dev->fd, (off_t)ireq.out.gpu_va);
+            if (anchor != MAP_FAILED) {
+               bo->exec = false;
+               bo->anchor = anchor;
+               bo->dmabuf_fd = dmabuf_fd;
+               bo->ahb = ahb;
+               bo->gpu_va = (uint64_t)(uintptr_t)anchor;
+               pan_kmod_bo_init(&bo->base, dev, exclusive_vm, ireq.out.va_pages * 4096,
+                                flags, p_atomic_inc_return(&kbase_dev->next_handle));
+               return &bo->base;
+            }
+         }
+         close(dmabuf_fd);
+         if (ahb && kbase_ahb_api.release)
+            kbase_ahb_api.release(ahb);
+      }
+   }
+
    union kbase_ioctl_mem_alloc req = {
       .in = {
          .va_pages = pages,
@@ -690,6 +863,8 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
 
    bo->exec = exec;
    bo->anchor = NULL;
+   bo->dmabuf_fd = -1;
+   bo->ahb = NULL;
 
    if (exec) {
       /* The exec zone hands back the address itself. Leave the mapping to whoever wants one:
@@ -732,24 +907,39 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 
    }
 
+   if (kbase_bo->dmabuf_fd >= 0)
+      close(kbase_bo->dmabuf_fd);
+   if (kbase_bo->ahb && kbase_ahb_api.release)
+      kbase_ahb_api.release(kbase_bo->ahb);
+
    pan_kmod_dev_free(bo->dev, kbase_bo);
 }
 
 static void *
 kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
 {
+   struct kbase_kmod_bo *kbase_bo = container_of(bo, struct kbase_kmod_bo, base);
+   /* For DMA-BUF backed BOs, MAP_FIXED / placed mappings must target the dma-buf fd
+    * because kbase (/dev/mali0) rejects MAP_FIXED and address hints. */
+   if (kbase_bo->dmabuf_fd >= 0 && ((flags & MAP_FIXED) || host_addr != NULL))
+      return os_mmap(host_addr, bo->size, prot, flags, kbase_bo->dmabuf_fd, 0);
+
    /* Both zones map at offset = the BO's GPU VA. For an exec BO that is the address the kernel
     * returned; for an ordinary one it is the anchor's address, and mapping it again yields a
     * second CPU view of the same memory. */
-   const off_t offset = container_of(bo, struct kbase_kmod_bo, base)->gpu_va;
+   const off_t offset = kbase_bo->gpu_va;
    return os_mmap(host_addr, bo->size, prot, flags, bo->dev->fd, offset);
 }
 
 static int
 kbase_kmod_bo_export(struct pan_kmod_bo *bo)
 {
+   struct kbase_kmod_bo *kbase_bo = container_of(bo, struct kbase_kmod_bo, base);
+   if (kbase_bo->dmabuf_fd >= 0)
+      return fcntl(kbase_bo->dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+
    /* kbase memory has no dma-buf of its own to hand out. */
-   mesa_loge("kbase: bo_export is not implemented");
+   mesa_loge("kbase: bo_export is not implemented for non-dmabuf BOs");
    return -1;
 }
 
@@ -823,6 +1013,8 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
 
    bo->exec = false;
    bo->anchor = anchor;
+   bo->dmabuf_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+   bo->ahb = NULL;
    bo->gpu_va = (uint64_t)(uintptr_t)anchor;
    pan_kmod_bo_init(&bo->base, dev, NULL, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED,
                     p_atomic_inc_return(&kbase_dev->next_handle));
