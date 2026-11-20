@@ -1,0 +1,38 @@
+name: Build PanVK Mali (Placed Memory Fix)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/panfrost/lib/kmod/kbase_kmod.c'
+      - 'src/panfrost/vulkan/panvk_device_memory.c'
+      - '.github/workflows/build-panvk.yml'
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build pkg-config glslang-tools \
+            python3-mako python3-packaging python3-yaml \
+            bison flex cmake libelf-dev libzstd-dev \
+            clang-18 llvm-18-dev libclang-18-dev libclc-18-dev libllvmspirvlib-18-dev \
+            zip
+          sudo ln -sf /usr/bin/llvm-config-18 /usr/local/bin/llvm-config
+      - name: Build PanVK Android driver
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          echo "Using NDK: $ANDROID_NDK_HOME"
+          chmod +x build.sh
+          ./build.sh "$ANDROID_NDK_HOME"
+          ls -lh dist/
+      - name: Upload Driver ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PanVK-Mali-PlacedFix
+          path: dist/*.zip
+          if-no-files-found: error
