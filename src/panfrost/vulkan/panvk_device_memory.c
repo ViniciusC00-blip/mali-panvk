@@ -116,8 +116,12 @@ panvk_AllocateMemory(VkDevice _device,
          bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
 
       bo_flags = panvk_device_adjust_bo_flags(device, bo_flags);
+      const bool use_dmabuf_backed =
+         can_be_exported ||
+         (device->vk.enabled_features.memoryMapPlaced &&
+          (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
       mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
-                                  can_be_exported ? NULL : device->kmod.vm,
+                                  use_dmabuf_backed ? NULL : device->kmod.vm,
                                   pAllocateInfo->allocationSize, bo_flags);
       if (!mem->bo) {
          result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
